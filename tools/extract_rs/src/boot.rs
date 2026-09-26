@@ -163,6 +163,26 @@ mod tests {
     }
 
     #[test]
+    fn release_skips_lookalike_banner() {
+        // Regression: Bluetooth's format string precedes the real banner on
+        // vendor kernels, and used to be returned as the release.
+        let mut kernel = b"Linux version %s (%s)\0Wrong link type (%d)\0".to_vec();
+        kernel.extend_from_slice(
+            b"Linux version 5.15.194-android13-8-00019-gf4321180a397-ab15212794 \
+              (build-user@build-host)",
+        );
+        let boot = BootImage {
+            kernel,
+            mtk_lz4: false,
+            mtk_gzip: false,
+        };
+        assert_eq!(
+            boot.release().as_deref(),
+            Some("5.15.194-android13-8-00019-gf4321180a397-ab15212794")
+        );
+    }
+
+    #[test]
     fn lz4_legacy_chunked_stream() {
         // Regression: legacy frames must be decoded block by block; a single
         // pass used to break at the 8 MiB block boundary.
@@ -250,15 +270,26 @@ impl BootImage {
         })
     }
 
+    /// Kernel release banner, e.g. `6.12.38-android16-5-g844001fb8721-ab14552068-4k`.
+    /// Images also carry lookalike strings (Bluetooth's `"Linux version %s (%s)"`
+    /// precedes the real banner on vendor kernels), so only a candidate that
+    /// parses as major.minor.patch is accepted.
     pub fn release(&self) -> Option<String> {
         let needle = b"Linux version ";
-        let pos = find_subslice(&self.kernel, needle)?;
-        let rest = &self.kernel[pos + needle.len()..];
-        let end = rest
-            .iter()
-            .position(|b| *b == 0 || *b == b'\r' || *b == b'\n' || *b == b' ')
-            .unwrap_or(rest.len());
-        Some(String::from_utf8_lossy(&rest[..end]).into_owned())
+        let mut cursor = 0usize;
+        while let Some(pos) = find_subslice_from(&self.kernel, needle, cursor) {
+            cursor = pos + needle.len();
+            let rest = &self.kernel[cursor..];
+            let end = rest
+                .iter()
+                .position(|b| *b == 0 || *b == b'\r' || *b == b'\n' || *b == b' ')
+                .unwrap_or(rest.len());
+            let candidate = String::from_utf8_lossy(&rest[..end]).into_owned();
+            if is_kernel_release(&candidate) {
+                return Some(candidate);
+            }
+        }
+        None
     }
 
     /// Locate the embedded BTF blob (largest valid candidate), returning its
@@ -362,6 +393,17 @@ fn gunzip(data: &[u8]) -> Result<Vec<u8>> {
         .read_to_end(&mut out)
         .map_err(|err| ExtractError::new(format!("invalid gzip payload: {err}")))?;
     Ok(out)
+}
+
+/// A banner token is a release only when it starts `major.minor.patch`; the
+/// remainder may carry the vendor suffix (`5.15.194-android13-8-...`).
+fn is_kernel_release(candidate: &str) -> bool {
+    let mut parts = candidate.split('.');
+    let (Some(major), Some(minor), Some(patch)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let numeric = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    numeric(major) && numeric(minor) && patch.starts_with(|c: char| c.is_ascii_digit())
 }
 
 pub fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
